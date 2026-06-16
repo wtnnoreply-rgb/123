@@ -10,14 +10,14 @@
    - `SERVICE_TOKEN` = رمز سري طويل من اختيارك (مثل: `gh_2025_xY9k...`)
 4. **Volumes:** اربط Volume على المسار `/data` (لحفظ جلسة WhatsApp بعد إعادة التشغيل).
 5. **Settings → Networking → Generate Domain** → احصل على رابط مثل:
-   `https://123-production-a844.up.railway.app`
+   `https://123-production-7c11.up.railway.app`
 
 ## ربط رقم WhatsApp
 
 افتح في المتصفح (مع استبدال الرابط والتوكن):
 
 ```
-https://123-production-a844.up.railway.app/qr
+https://123-production-7c11.up.railway.app/qr
 ```
 أرسل التوكن في Header: `Authorization: Bearer YOUR_TOKEN`
 

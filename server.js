@@ -27,17 +27,53 @@ let connState = "disconnected";
 let starting = false;
 let lastError = null;
 let lastUpdateAt = null;
+let lastQrAt = null;
+let lastRestartAt = null;
 let lastInbound = null;
 let lastActivation = null;
 let activationSyncTimer = null;
 const serviceStartedAt = Date.now();
+const QR_TTL_MS = 5 * 60_000;
 
 const activationPending = new Map();
 const activationConfirmed = new Set();
 
+// ---- Live chats store (built from Baileys events) ----
+// Map<phone, { phone, name, jid, lastMessageAt }>
+const liveChats = new Map();
+
+function rememberChat({ jid, phone, name, ts }) {
+  const p = normalizePhone(phone || phoneFromJid(jid));
+  if (!p) return;
+  const prev = liveChats.get(p) || {};
+  const nextTs = Number(ts || prev.lastMessageAt || 0);
+  liveChats.set(p, {
+    phone: p,
+    jid: jid || prev.jid || jidFor(p),
+    name: name || prev.name || null,
+    lastMessageAt: nextTs,
+  });
+}
+
+function rememberFromMessage(msg) {
+  if (!msg) return;
+  const jid = msg.key?.remoteJid;
+  if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") return;
+  const senderPn = msg.key?.senderPn || msg.key?.participantPn || "";
+  const phone = senderPn || phoneFromJid(jid);
+  const name = msg.pushName || null;
+  const ts = timestampToMs(msg.messageTimestamp);
+  rememberChat({ jid, phone, name, ts });
+}
+
 function touch(error = null) {
   lastUpdateAt = new Date().toISOString();
   if (error) lastError = String(error?.message || error);
+}
+
+function qrIsFresh() {
+  if (!latestQR || !lastQrAt) return false;
+  return Date.now() - Date.parse(lastQrAt) < QR_TTL_MS;
 }
 
 function jidFor(to) {
@@ -314,6 +350,8 @@ async function syncActivationRepliesFromConversations() {
 async function start() {
   if (starting) return;
   starting = true;
+  if (!qrIsFresh()) connState = "starting";
+  touch();
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
@@ -326,16 +364,54 @@ async function start() {
 
     sock.ev.on("creds.update", saveCreds);
 
+    // Initial history sync: WhatsApp pushes existing chats/contacts after login.
+    sock.ev.on("messaging-history.set", (h) => {
+      try {
+        for (const c of h?.chats || []) {
+          if (!c?.id || c.id.endsWith("@g.us") || c.id === "status@broadcast") continue;
+          rememberChat({
+            jid: c.id,
+            phone: phoneFromJid(c.id),
+            name: c.name || null,
+            ts: timestampToMs(c.conversationTimestamp),
+          });
+        }
+        for (const ct of h?.contacts || []) {
+          if (!ct?.id || !ct.id.endsWith?.("@s.whatsapp.net")) continue;
+          rememberChat({ jid: ct.id, phone: phoneFromJid(ct.id), name: ct.notify || ct.name || null });
+        }
+        for (const m of h?.messages || []) rememberFromMessage(m);
+      } catch (e) {
+        console.error("messaging-history.set handler error", e?.message || e);
+      }
+    });
+
+    sock.ev.on("chats.upsert", (chats) => {
+      for (const c of chats || []) {
+        if (!c?.id || c.id.endsWith?.("@g.us") || c.id === "status@broadcast") continue;
+        rememberChat({ jid: c.id, phone: phoneFromJid(c.id), name: c.name || null, ts: timestampToMs(c.conversationTimestamp) });
+      }
+    });
+    sock.ev.on("contacts.upsert", (cts) => {
+      for (const ct of cts || []) {
+        if (!ct?.id || !ct.id.endsWith?.("@s.whatsapp.net")) continue;
+        rememberChat({ jid: ct.id, phone: phoneFromJid(ct.id), name: ct.notify || ct.name || null });
+      }
+    });
+
     sock.ev.on("connection.update", async (u) => {
       const { connection, lastDisconnect, qr } = u;
       touch(lastDisconnect?.error || null);
+      if (connection === "connecting" && !qrIsFresh()) connState = "connecting";
       if (qr) {
         latestQR = await QRCode.toDataURL(qr);
-        connState = "connecting";
+        lastQrAt = new Date().toISOString();
+        connState = "qr";
         lastError = null;
       }
       if (connection === "open") {
         latestQR = null;
+        lastQrAt = null;
         connState = "open";
         if (!activationSyncTimer) {
           activationSyncTimer = setInterval(() => syncActivationRepliesFromConversations().catch((e) => console.error("activation sync failed", e?.message || e)), 15_000);
@@ -343,10 +419,15 @@ async function start() {
         syncActivationRepliesFromConversations().catch((e) => console.error("activation sync failed", e?.message || e));
       }
       if (connection === "close") {
-        connState = "disconnected"; latestQR = null;
         if (activationSyncTimer) { clearInterval(activationSyncTimer); activationSyncTimer = null; }
         const code = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
+        if (loggedOut) {
+          connState = "disconnected"; latestQR = null; lastQrAt = null;
+        } else {
+          connState = qrIsFresh() ? "qr" : "connecting";
+          if (!qrIsFresh()) { latestQR = null; lastQrAt = null; }
+        }
         if (loggedOut) {
           try { const fs = await import("fs/promises"); await fs.rm(AUTH_DIR, { recursive: true, force: true }); } catch {}
         }
@@ -357,6 +438,8 @@ async function start() {
     sock.ev.on("messages.upsert", async (m) => {
       try {
         for (const msg of m.messages || []) {
+          // Track every direct chat (in or out) for the /contacts endpoint.
+          rememberFromMessage(msg);
           if (!shouldProcessIncoming(msg)) continue;
           const jid = msg.key.remoteJid;
           if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue;
@@ -397,16 +480,18 @@ async function start() {
     });
   } catch (e) {
     touch(e);
+    connState = "error";
     console.error("start error", e);
     setTimeout(() => { starting = false; start(); }, 3000);
   }
 }
 
 async function restart() {
+  lastRestartAt = new Date().toISOString();
   try { await sock?.logout(); } catch {}
   try { sock?.end?.(undefined); } catch {}
   try { const fs = await import("fs/promises"); await fs.rm(AUTH_DIR, { recursive: true, force: true }); } catch {}
-  sock = null; latestQR = null; connState = "disconnected"; starting = false;
+  sock = null; latestQR = null; lastQrAt = null; connState = "restarting"; starting = false;
   start();
 }
 
@@ -417,10 +502,14 @@ function auth(req, res, next) {
 }
 
 app.get("/", (_req, res) => res.json({ ok: true, state: connState }));
-app.get("/status", auth, (_req, res) => res.json({ state: connState, hasQR: !!latestQR, lastError, lastUpdateAt, lastInbound, lastActivation }));
+app.get("/status", auth, (_req, res) => {
+  const hasQR = qrIsFresh();
+  if (!hasQR && latestQR) { latestQR = null; lastQrAt = null; if (connState === "qr") connState = "disconnected"; }
+  res.json({ state: connState, hasQR, qr: hasQR ? latestQR : null, lastError, lastUpdateAt, lastQrAt, lastRestartAt, starting, lastInbound, lastActivation });
+});
 app.get("/qr", auth, (_req, res) => {
-  if (!latestQR) return res.status(404).json({ error: "no_qr", state: connState });
-  res.json({ qr: latestQR, state: connState });
+  if (!qrIsFresh()) return res.status(404).json({ error: "no_qr", state: connState, lastError, lastUpdateAt });
+  res.json({ qr: latestQR, state: connState, lastQrAt });
 });
 app.post("/logout", auth, async (_req, res) => { await restart(); res.json({ ok: true, restarted: true }); });
 app.post("/restart", auth, async (_req, res) => { await restart(); res.json({ ok: true }); });
@@ -489,6 +578,19 @@ app.post("/sync-activation-replies", auth, async (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "sync_failed" });
   }
+});
+
+// Live contacts from the currently-connected WhatsApp account (Baileys store).
+// Returns ONLY direct (1:1) chats — not groups, not status broadcast.
+app.get("/contacts", auth, (_req, res) => {
+  if (connState !== "open") {
+    return res.status(503).json({ ok: false, error: "not_connected", state: connState, contacts: [] });
+  }
+  const contacts = Array.from(liveChats.values())
+    .filter((c) => c.phone)
+    .sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0))
+    .map((c) => ({ phone: c.phone, name: c.name || null, lastMessageAt: c.lastMessageAt || 0 }));
+  res.json({ ok: true, state: connState, count: contacts.length, contacts });
 });
 
 app.listen(PORT, () => console.log(`WhatsApp service on :${PORT}`));
